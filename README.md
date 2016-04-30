@@ -1,6 +1,6 @@
 # gateway-configs
 gateway-configs
-Konfigurationen der Gateways und weiterer Maschinen des Freifunk Donau-Ries in Anlehnung an Mainz Wiesbaden Umgebung.
+Konfigurationen der Gateways und weiterer Maschinen des Freifunk Donau-Ries in Anlehnung an Mainz Wiesbaden Umgebung https://github.com/freifunk-mwu/gateway-configs .
 
 Note
 
