@@ -1,0 +1,304 @@
+timeformat protocol iso long;
+
+# local addresses
+define wi_addr_ic     		= fec0::a:cf:0:38; # lotuswurzel = wiesbaden1
+define wi_addr_wi     		= fd56:b4dc:4b1e::a38:17; # wi-mesh-ip
+define mz_addr_mz     		= fd37:b4dc:4b1e::a25:17; # mz-mesh-ip
+
+# prefixes repeated in functions -> see there
+define wi_prefix      		= fd56:b4dc:4b1e::/48; # wi ula-prefix
+define mz_prefix      		= fd37:b4dc:4b1e::/48; # mz ula-prefix
+define wi_ffrl_prefix 		= 2a03:2260:11b::/48; # wi public ffrl prefix
+define mz_ffrl_prefix 		= 2a03:2260:11a::/48; # mz public ffrl prefix
+
+# AS
+define mz_as = 65037; # as of mainz
+define wi_as = 65036; # as of wiesbaden
+
+router id 10.207.0.56;   # traditionally v4-addr as router id
+
+# routing tables
+#table icvpn;    # BGP Peerings ICVPN
+table ffrl;	# BGP Peerings FFRL
+
+# ROA
+roa table roa_icvpn {
+  include "ebgp_roa_v6.inc";
+}
+
+# functions
+function is_default() {
+    return net ~ [
+        ::/0
+    ];
+}
+
+function is_ula() {
+    return net ~ [
+        fc00::/7{48,64}
+    ];
+}
+
+function is_mwu_self_nets() {
+    return net ~ [
+        fd56:b4dc:4b1e::/48+,
+        fd37:b4dc:4b1e::/48+
+    ];
+}
+
+function is_ffrl_public_nets() {
+    return net ~ [
+        2a03:2260:11a::/48{48,56},
+        2a03:2260:11b::/48{48,56}
+    ];
+}
+
+function is_ffrl_tunnel_nets() {
+    return net ~ [
+        2a03:2260:0:91::/64,
+        2a03:2260:0:92::/64,
+        2a03:2260:0:e9::/64,
+        2a03:2260:0:ea::/64,
+        2a03:2260:0:133::/64,
+        2a03:2260:0:134::/64
+    ];
+}
+
+function is_wi_self_net() {
+    return net ~ [
+        fd56:b4dc:4b1e::/48+
+    ];
+}
+
+function is_mz_self_net() {
+    return net ~ [
+        fd37:b4dc:4b1e::/48+
+    ];
+}
+
+# filters
+filter ebgp_icvpn_import_filter {
+    if is_mwu_self_nets() then reject;
+    if roa_check(roa_icvpn) = ROA_VALID then {
+        if is_ula() then accept;
+    } else {
+        if is_ula() then {
+            if roa_check(roa_icvpn) = ROA_UNKNOWN then {
+                print "ROA UNKNOWN for net, accepting: ", net, " ASN: ", bgp_path.last;
+                accept;
+            }
+            if roa_check(roa_icvpn) = ROA_INVALID then {
+                print "ROA INVALID for net, accepting: ", net, " ASN: ", bgp_path.last;
+                accept;
+            }
+        } else {
+            print "Non ULA net, rejecting: ", net, " ASN: ", bgp_path.last;
+            reject;
+        }
+        reject;
+    }
+    reject;
+}
+
+filter ebgp_ffrl_import_filter {
+    if is_default() then accept;
+    reject;
+}
+
+filter ebgp_ffrl_export_filter {
+    if is_ffrl_public_nets() then accept;
+    reject;
+}
+
+# protocols
+# necessary to inform bird about devices
+protocol device {
+    scan time 30;
+};
+
+# learn about directly connected community subnets
+protocol direct mwu_subnets {
+#    table icvpn;
+    interface "mzBR";
+    interface "wiBR";
+    import where is_mwu_self_nets();
+};
+
+# learn tunnel addresses for ffrl
+protocol direct ffrl_tunnels {
+    table ffrl;
+    interface "ffrl-*";
+    import where is_ffrl_tunnel_nets();
+}
+
+# static routes
+protocol static ffrl_public_routes {
+    table ffrl;
+    route 2a03:2260:11a::/48 reject;
+    route 2a03:2260:11b::/48 reject;
+}
+
+# kernel protocols
+protocol kernel kernel_mwu {
+    scan time 30;
+    import none;
+    export filter {
+        if is_mwu_self_nets() then
+            reject;
+        krt_prefsrc = wi_addr_ic;
+        accept;
+    };
+#    table icvpn;
+    kernel table ipt_icvpn;
+};
+
+protocol kernel kernel_ffrl {
+    scan time 30;
+    import none;
+    export filter {
+        if is_default() then accept;
+        reject;
+    };
+    table ffrl;
+    kernel table ipt_ffinetexit;
+}
+
+# template for iBGP
+template bgp ibgp_wi {
+    local wi_addr_wi as wi_as;
+#    table icvpn;
+    import all;  # EXPERIMENT !!!!!
+    export where source = RTS_BGP;
+    direct;
+    gateway direct;
+};
+
+# template for iBGP - export mz subnet 4 wi bb-gate
+template bgp bgp_ibgp_bbgate_wi {
+    local wi_addr_wi as wi_as;
+    import none;
+    export filter {
+        if source = RTS_BGP then {
+            if is_mwu_self_nets() then reject;
+            accept;
+        }
+        if is_mz_self_net() then accept;
+        reject;
+    };
+    direct;
+    gateway direct;
+};
+
+
+# template for eBGP ICVPN
+template bgp ebgp_ic {
+    local wi_addr_ic as wi_as;
+#    table icvpn;
+    import filter ebgp_icvpn_import_filter;
+    export filter {
+        if is_wi_self_net() then {  # own nets
+#            bgp_path.prepend(65036);
+            accept;
+        }
+        if is_mz_self_net() then {  # foreign mz nets
+            bgp_path.delete(65036);
+            bgp_path.prepend(65037);
+            bgp_path.prepend(65036);
+            accept;
+        }
+        if source = RTS_BGP then {
+            accept;
+        }
+        reject;
+    };
+    direct;
+};
+
+# template for eBGP FFRL
+template bgp ffrl_uplink {
+    table ffrl;
+    local as mz_as;
+    import keep filtered;
+    import filter ebgp_ffrl_import_filter;
+    export filter ebgp_ffrl_export_filter;
+    next hop self;
+    direct;
+};
+
+
+
+# P E E R I N G S
+# #### iBGP #####
+
+protocol bgp mwu_wiesbaden2 from ibgp_wi { # kaschu
+    neighbor fd56:b4dc:4b1e::a38:d0 as wi_as;
+};
+
+protocol bgp mwu_aubergine from ibgp_wi { # aubergine
+    neighbor fd56:b4dc:4b1e::a38:103 as 65036;
+};
+
+protocol bgp mwu_zwiebel from ibgp_wi { # zwiebel
+    neighbor fd56:b4dc:4b1e::a38:100 as 65036;
+};
+
+protocol bgp mwu_glueckskeks from ibgp_wi { # glueckskeks
+    neighbor fd56:b4dc:4b1e::a38:101 as 65036;
+};
+
+protocol bgp mwu_zuckerwatte from ibgp_wi { # zuckerwatte
+    neighbor fd56:b4dc:4b1e::a38:102 as 65036;
+};
+
+protocol bgp mwu_suesskartoffel from ibgp_wi { # suesskartoffel
+    neighbor fd56:b4dc:4b1e::a38:104 as 65036;
+};
+
+protocol bgp mwu_zitronengras from bgp_ibgp_bbgate_wi { # zitronengras
+    neighbor fd56:b4dc:4b1e::a38:1d as wi_as;
+};
+
+# P E E R I N G S
+# #### eBGP #####
+
+# FFRL Berlin bb-a.ak.ber
+protocol bgp ffrl_ber1 from ffrl_uplink {
+    source address 2a03:2260:0:e9::2;
+    neighbor 2a03:2260:0:e9::1 as 201701;
+}
+
+# FFRL Berlin bb-b.ak.ber
+protocol bgp ffrl_ber2 from ffrl_uplink {
+    source address 2a03:2260:0:91::2;
+    neighbor 2a03:2260:0:91::1 as 201701;
+}
+
+# FFRL Duesseldorf bb-a.ix.dus
+protocol bgp ffrl_dus1 from ffrl_uplink {
+    source address 2a03:2260:0:133::2;
+    neighbor 2a03:2260:0:133::1 as 201701;
+}
+
+# FFRL Duesseldorf bb-b.ix.dus
+protocol bgp ffrl_dus2 from ffrl_uplink {
+    source address 2a03:2260:0:92::2;
+    neighbor 2a03:2260:0:92::1 as 201701;
+}
+
+# FFRL Frankfurt bb-a.fra3.fra
+protocol bgp ffrl_fra1 from ffrl_uplink {
+    source address 2a03:2260:0:ea::2;
+    neighbor 2a03:2260:0:ea::1 as 201701;
+    default bgp_local_pref 200;
+}
+
+# FFRL Frankfurt bb-b.fra3.fra
+protocol bgp ffrl_fra2 from ffrl_uplink {
+    source address 2a03:2260:0:134::2;
+    neighbor 2a03:2260:0:134::1 as 201701;
+}
+# following the pattern, a load of 'em:
+# protocol bgp <PeerName> from ebgp_ic {
+#    neighbor <PeerAddrV6> as <PeerAS>;
+#};
+include "ebgp_peers_v6.inc";
